@@ -30,9 +30,11 @@ ALLOWED = {
 DATA_FILE = os.environ.get("DATA_FILE", "data.json")
 
 URL = "https://funpay.com/chips/51/"
-SERVER_NAME = "Grnd.gg Grand Mobile №01"
+DEFAULT_SERVER = "Grnd.gg Grand Mobile №01"   # сервер по умолчанию
+GAME_FILTER = "grand mobile"   # по этой подстроке отбираем серверы в выборе
 LIMIT = 30             # сколько лотов всего доступно в списке
 PAGE = 10              # сколько лотов на одной странице
+SRV_PAGE = 15          # сколько серверов на одной странице выбора
 MIN_BUTTONS = [0, 10, 50, 100]   # кнопки фильтра по количеству (кк)
 CACHE_TTL = 10         # секунд: не дёргаем FunPay чаще
 RATES_TTL = 3600       # секунд: курс валют обновляем раз в час
@@ -61,7 +63,7 @@ _cache = {"t": 0.0, "data": None}
 _rates = {"t": 0.0, "EUR": None, "USD": None, "src": "нет"}
 
 
-# ---------- хранилище (фильтры и уведомления) ----------
+# ---------- хранилище (фильтры, сервер, уведомления) ----------
 
 STORE = {"chats": {}}
 
@@ -94,6 +96,7 @@ def chat_cfg(chat_id):
     c.setdefault("min", 0.0)
     c.setdefault("online", False)
     c.setdefault("alert", None)
+    c.setdefault("server", DEFAULT_SERVER)
     return c
 
 
@@ -134,6 +137,19 @@ def is_online(item) -> bool:
     if item.select_one(".media-user.online"):
         return True
     return False
+
+
+def server_num(name: str):
+    m = re.search(r"№\s*(\d+)", name)
+    return int(m.group(1)) if m else None
+
+
+def short_server(name: str) -> str:
+    if GAME_FILTER in norm(name):
+        m = re.search(r"№\s*\d+", name)
+        if m:
+            return m.group(0).replace(" ", "")
+    return name if len(name) <= 24 else name[:23] + "…"
 
 
 # ---------- курс валют ----------
@@ -235,6 +251,7 @@ def get_page():
 
 
 def load():
+    """Скачивает страницу и разбирает лоты ВСЕХ серверов (кэш на CACHE_TTL)."""
     now = time.time()
     if _cache["data"] and now - _cache["t"] < CACHE_TTL:
         return _cache["data"]
@@ -245,11 +262,12 @@ def load():
     items = soup.select("a.tc-item")
 
     offers = []
+    servers = {}   # название сервера -> число лотов
     sample = ""
     for item in items:
         server_el = item.select_one(".tc-server")
         server = server_el.get_text(strip=True) if server_el else ""
-        if norm(server) != norm(SERVER_NAME):
+        if not server:
             continue
 
         seller_el = item.select_one(".media-user-name")
@@ -269,8 +287,11 @@ def load():
 
         rub, converted = to_rub(price, cur)
         link = urljoin("https://funpay.com/", href)
+        servers[server] = servers.get(server, 0) + 1
         offers.append({
             "id": link,
+            "server": server,
+            "skey": norm(server),
             "seller": seller_el.get_text(strip=True),
             "amount": amount,
             "price": price,
@@ -286,6 +307,7 @@ def load():
     ))
     data = {
         "offers": offers,
+        "servers": servers,
         "total_items": len(items),
         "status": r.status_code,
         "method": method,
@@ -294,12 +316,39 @@ def load():
     }
     _cache["t"] = now
     _cache["data"] = data
-    log.info("страница обновлена: лотов сервера %d", len(offers))
+    log.info("страница обновлена: лотов %d, серверов %d",
+             len(offers), len(servers))
     return data
 
 
 def fetch_offers():
     return load()["offers"]
+
+
+def for_server(offers, server):
+    key = norm(server)
+    return [o for o in offers if o["skey"] == key]
+
+
+def server_counts():
+    d = _cache["data"]
+    return d["servers"] if d else {}
+
+
+def server_sort_key(name):
+    grand = GAME_FILTER in norm(name)
+    num = server_num(name)
+    return (0 if grand else 1, num if num is not None else 10 ** 6, name.lower())
+
+
+def grand_names(servers):
+    return sorted(
+        (n for n in servers if GAME_FILTER in norm(n)), key=server_sort_key
+    )
+
+
+def all_names(servers):
+    return sorted(servers, key=server_sort_key)
 
 
 # ---------- фильтры ----------
@@ -324,8 +373,9 @@ def filters_text(f):
 
 def matching_alert(offers, cfg):
     a = cfg["alert"]
+    srv = for_server(offers, a.get("server", DEFAULT_SERVER))
     return [
-        o for o in apply_filters(offers, cfg)
+        o for o in apply_filters(srv, cfg)
         if o["rub"] is not None and o["rub"] <= a["price"]
     ]
 
@@ -335,9 +385,10 @@ def matching_alert(offers, cfg):
 async def refresh_shown(context, f):
     """Скачивает свежие данные и обновляет список, который видит пользователь."""
     all_offers = await asyncio.to_thread(fetch_offers)
-    offers = apply_filters(all_offers, f)
+    srv = for_server(all_offers, f["server"])
+    offers = apply_filters(srv, f)
     context.chat_data["shown"] = offers[:LIMIT]
-    context.chat_data["total"] = len(all_offers)
+    context.chat_data["total"] = len(srv)
     context.chat_data["page"] = 0
     return all_offers
 
@@ -351,12 +402,12 @@ def build_view(context, f):
     context.chat_data["page"] = page
 
     if not shown:
-        text = (f"{SERVER_NAME}\n{filters_text(f)}\n\n"
+        text = (f"{f['server']}\n{filters_text(f)}\n\n"
                 f"По текущим фильтрам лотов нет (всего на сервере: {total}).")
     else:
         start = page * PAGE
         chunk = shown[start:start + PAGE]
-        lines = [SERVER_NAME, filters_text(f), f"Страница {page + 1}/{pages}\n",
+        lines = [f["server"], filters_text(f), f"Страница {page + 1}/{pages}\n",
                  "№. продавец / кол-во / цена за 1кк\n"]
         for i, o in enumerate(chunk, start + 1):
             lines.append(
@@ -405,6 +456,78 @@ def build_view(context, f):
         InlineKeyboardButton("🔄 Обновить", callback_data="r"),
     ])
 
+    # выбор сервера
+    rows.append([
+        InlineKeyboardButton(
+            f"🌐 Сервер: {short_server(f['server'])}", callback_data="srv"
+        )
+    ])
+
+    return text, InlineKeyboardMarkup(rows)
+
+
+# ---------- выбор сервера ----------
+
+def set_picker(context, names, all_flag=False, custom=False, page=0):
+    context.chat_data["srv"] = {
+        "names": names, "all": all_flag, "custom": custom, "page": page,
+    }
+
+
+def default_picker_names(servers):
+    """Серверы Grand Mobile; если таких нет, все серверы."""
+    names = grand_names(servers)
+    return names, bool(names)
+
+
+def build_server_picker(context, f):
+    st = context.chat_data["srv"]
+    names = st["names"]
+    counts = server_counts()
+    pages = max(1, -(-len(names) // SRV_PAGE))
+    page = min(max(st["page"], 0), pages - 1)
+    st["page"] = page
+    chunk = names[page * SRV_PAGE:(page + 1) * SRV_PAGE]
+
+    if st["custom"]:
+        what = "Найдено несколько серверов"
+    elif st["all"]:
+        what = "Все серверы FunPay"
+    else:
+        what = "Серверы Grand Mobile"
+    text = (f"🌐 {what}\nСейчас: {f['server']}\n"
+            f"Всего: {len(names)}, страница {page + 1}/{pages}\n"
+            "(в скобках число лотов)")
+
+    rows, row = [], []
+    cur_key = norm(f["server"])
+    for k, name in enumerate(chunk):
+        idx = page * SRV_PAGE + k
+        label = (("✅ " if norm(name) == cur_key else "")
+                 + f"{short_server(name)} ({counts.get(name, 0)})")
+        row.append(InlineKeyboardButton(label, callback_data=f"sv:{idx}"))
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("◀", callback_data=f"sp:{page - 1}"))
+        nav.append(InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="n"))
+        if page < pages - 1:
+            nav.append(InlineKeyboardButton("▶", callback_data=f"sp:{page + 1}"))
+        rows.append(nav)
+
+    if not st["custom"]:
+        rows.append([InlineKeyboardButton(
+            "🎮 Только Grand Mobile" if st["all"] else "🌍 Все серверы",
+            callback_data="sa",
+        )])
+    rows.append([InlineKeyboardButton("↩ К списку", callback_data="r")])
+
     return text, InlineKeyboardMarkup(rows)
 
 
@@ -420,11 +543,12 @@ async def safe_edit(message, text, markup):
 async def resolve_slot(context, f, n):
     """Возвращает (статус, текст). Статусы: ok, gone, range."""
     all_offers = await asyncio.to_thread(fetch_offers)
+    srv = for_server(all_offers, f["server"])
 
     shown = context.chat_data.get("shown")
     if not shown:
-        context.chat_data["shown"] = shown = apply_filters(all_offers, f)[:LIMIT]
-        context.chat_data["total"] = len(all_offers)
+        context.chat_data["shown"] = shown = apply_filters(srv, f)[:LIMIT]
+        context.chat_data["total"] = len(srv)
         context.chat_data["page"] = 0
 
     if n < 1 or n > len(shown):
@@ -437,9 +561,9 @@ async def resolve_slot(context, f, n):
     cur = {o["id"]: o for o in all_offers}.get(old["id"])
 
     if cur is None:
-        fresh = apply_filters(all_offers, f)
+        fresh = apply_filters(srv, f)
         context.chat_data["shown"] = fresh[:LIMIT]
-        context.chat_data["total"] = len(all_offers)
+        context.chat_data["total"] = len(srv)
         context.chat_data["page"] = 0
         return "gone", f"Слот {n} ({old['seller']}) уже исчез с сайта."
 
@@ -472,14 +596,58 @@ async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------- команды ----------
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("pong (версия 8)")
+    await update.message.reply_text("pong (версия 9)")
+
+
+async def show_list_new(update: Update, context: ContextTypes.DEFAULT_TYPE, f):
+    msg = await update.message.reply_text("⏳ Загружаю...")
+    await refresh_shown(context, f)
+    text, markup = build_view(context, f)
+    await safe_edit(msg, text, markup)
 
 
 async def virts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     f = chat_cfg(update.effective_chat.id)
-    msg = await update.message.reply_text("⏳ Загружаю...")
-    await refresh_shown(context, f)
-    text, markup = build_view(context, f)
+    await show_list_new(update, context, f)
+
+
+async def server_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    f = chat_cfg(update.effective_chat.id)
+    msg = await update.message.reply_text("⏳ Загружаю серверы...")
+    d = await asyncio.to_thread(load)
+    servers = d["servers"]
+    query = " ".join(context.args).strip()
+
+    if not query:
+        names, is_grand = default_picker_names(servers)
+        if not is_grand:
+            names = all_names(servers)
+        set_picker(context, names, all_flag=not is_grand)
+        text, markup = build_server_picker(context, f)
+        await safe_edit(msg, text, markup)
+        return
+
+    if query.isdigit():
+        n = int(query)
+        matches = [x for x in grand_names(servers) if server_num(x) == n]
+    else:
+        q = norm(query)
+        matches = [x for x in all_names(servers) if q in norm(x)]
+
+    if not matches:
+        await safe_edit(msg, f"Сервер «{query}» не найден. Список: /server", None)
+        return
+
+    if len(matches) == 1:
+        f["server"] = matches[0]
+        save_store()
+        await refresh_shown(context, f)
+        text, markup = build_view(context, f)
+        await safe_edit(msg, text, markup)
+        return
+
+    set_picker(context, matches, custom=True)
+    text, markup = build_server_picker(context, f)
     await safe_edit(msg, text, markup)
 
 
@@ -493,7 +661,65 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.answer()
             return
 
-        # ссылка на слот
+        # ----- выбор сервера -----
+        if data == "srv":
+            await q.answer()
+            d = await asyncio.to_thread(load)
+            names, is_grand = default_picker_names(d["servers"])
+            if not is_grand:
+                names = all_names(d["servers"])
+            set_picker(context, names, all_flag=not is_grand)
+            t, markup = build_server_picker(context, f)
+            await safe_edit(q.message, t, markup)
+            return
+
+        if data == "sa":
+            st = context.chat_data.get("srv")
+            if not st:
+                await q.answer("Список устарел, отправь /server заново.",
+                               show_alert=True)
+                return
+            await q.answer()
+            d = await asyncio.to_thread(load)
+            if st["all"]:
+                names, is_grand = default_picker_names(d["servers"])
+                if not is_grand:
+                    names = all_names(d["servers"])
+                set_picker(context, names, all_flag=not is_grand)
+            else:
+                set_picker(context, all_names(d["servers"]), all_flag=True)
+            t, markup = build_server_picker(context, f)
+            await safe_edit(q.message, t, markup)
+            return
+
+        if data.startswith("sp:"):
+            st = context.chat_data.get("srv")
+            if not st:
+                await q.answer("Список устарел, отправь /server заново.",
+                               show_alert=True)
+                return
+            st["page"] = int(data[3:])
+            await q.answer()
+            t, markup = build_server_picker(context, f)
+            await safe_edit(q.message, t, markup)
+            return
+
+        if data.startswith("sv:"):
+            st = context.chat_data.get("srv")
+            idx = int(data[3:])
+            if not st or idx >= len(st["names"]):
+                await q.answer("Список устарел, отправь /server заново.",
+                               show_alert=True)
+                return
+            f["server"] = st["names"][idx]
+            save_store()
+            await q.answer(f"Сервер: {short_server(f['server'])}")
+            await refresh_shown(context, f)
+            t, markup = build_view(context, f)
+            await safe_edit(q.message, t, markup)
+            return
+
+        # ----- ссылка на слот -----
         if data.startswith("s:"):
             n = int(data[2:])
             if not context.chat_data.get("shown"):
@@ -512,7 +738,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await q.answer(text, show_alert=True)
             return
 
-        # переключение страницы (без перезагрузки данных, чтобы номера не «поехали»)
+        # ----- переключение страницы (без перезагрузки данных) -----
         if data.startswith("p:"):
             if not context.chat_data.get("shown"):
                 await q.answer("Список устарел, отправь /virts заново.",
@@ -524,7 +750,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await safe_edit(q.message, t, markup)
             return
 
-        # фильтры и обновление: перезагружаем данные
+        # ----- фильтры и обновление: перезагружаем данные -----
         if data.startswith("m:"):
             f["min"] = float(data[2:])
             save_store()
@@ -587,13 +813,15 @@ async def alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         a = cfg["alert"]
         if a:
             await update.message.reply_text(
-                f"🔔 Уведомления включены: лоты дешевле {fmt_num(a['price'])} ₽ "
-                f"за 1кк.\n{filters_text(cfg)}\nВыключить: /alert off"
+                f"🔔 Уведомления включены: {a.get('server', DEFAULT_SERVER)}, "
+                f"лоты дешевле {fmt_num(a['price'])} ₽ за 1кк.\n"
+                f"{filters_text(cfg)}\nВыключить: /alert off"
             )
         else:
             await update.message.reply_text(
                 "Уведомления выключены.\nВключить: /alert 30 "
-                "(писать, когда появится лот дешевле 30 ₽ за 1кк)"
+                "(писать, когда на выбранном сервере появится лот "
+                "дешевле 30 ₽ за 1кк)"
             )
         return
 
@@ -609,16 +837,16 @@ async def alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Напиши цену числом, например: /alert 30")
         return
 
-    cfg["alert"] = {"price": price, "notified": []}
+    cfg["alert"] = {"price": price, "notified": [], "server": cfg["server"]}
     offers = await asyncio.to_thread(fetch_offers)
     now_match = matching_alert(offers, cfg)
     cfg["alert"]["notified"] = sorted(o["id"] for o in now_match)
     save_store()
 
     text = (
-        f"🔔 Готово! Напишу, когда появится новый лот дешевле "
-        f"{fmt_num(price)} ₽ за 1кк.\n{filters_text(cfg)}\n"
-        f"Проверка раз в {CHECK_INTERVAL // 60} мин."
+        f"🔔 Готово! Сервер: {cfg['server']}.\n"
+        f"Напишу, когда появится новый лот дешевле {fmt_num(price)} ₽ за 1кк.\n"
+        f"{filters_text(cfg)}\nПроверка раз в {CHECK_INTERVAL // 60} мин."
     )
     if now_match:
         text += (f"\n\nСейчас таких лотов уже {len(now_match)} "
@@ -648,10 +876,12 @@ async def slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    f = chat_cfg(update.effective_chat.id)
     await update.message.reply_text("⏳ Проверяю...")
     d = await asyncio.to_thread(load)
     rates = get_rates()
-    online = sum(1 for o in d["offers"] if o["online"])
+    cur_offers = for_server(d["offers"], f["server"])
+    online = sum(1 for o in cur_offers if o["online"])
     alerts = sum(1 for c in STORE["chats"].values() if c.get("alert"))
     rate_line = (
         f"EUR {rates['EUR']:.2f} ₽, USD {rates['USD']:.2f} ₽ ({rates['src']})"
@@ -664,7 +894,10 @@ async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Рубли с сайта: {'да' if d['is_rub'] else 'нет (пересчёт по курсу)'}\n"
         f"Пример текста цены: {d['sample']}\n"
         f"Курс: {rate_line}\n"
-        f"Лотов сервера: {len(d['offers'])}, онлайн: {online}\n"
+        f"Серверов на сайте: {len(d['servers'])}, "
+        f"из них Grand Mobile: {len(grand_names(d['servers']))}\n"
+        f"Текущий сервер: {f['server']}\n"
+        f"Лотов сервера: {len(cur_offers)}, онлайн: {online}\n"
         f"Доступ: {access}\n"
         f"Активных уведомлений: {alerts}"
     )
@@ -673,12 +906,14 @@ async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "/virts: список слотов с кнопками (номера, страницы, фильтры)\n"
+        "/virts: список слотов с кнопками (номера, страницы, фильтры, сервер)\n"
         "«4 слот» или «слот 4»: ссылка на слот\n"
+        "/server: выбор сервера (/server 5 или /server текст)\n"
         "/min 50: только лоты от 50 кк (/min 0 снимает)\n"
         "/online: вкл/выкл только продавцы онлайн\n"
         "/reset: сбросить фильтры\n"
-        "/alert 30: написать, когда появится лот дешевле 30 ₽ за 1кк\n"
+        "/alert 30: написать, когда на выбранном сервере появится лот "
+        "дешевле 30 ₽ за 1кк\n"
         "/alert off: выключить уведомления\n"
         "/myid: узнать свой Telegram ID\n"
         "/ping: проверка, что бот жив"
@@ -703,7 +938,10 @@ async def alert_loop(app):
                     new = [o for o in match if o["id"] not in old]
 
                     if new:
-                        lines = [f"🔔 Лоты дешевле {fmt_num(a['price'])} ₽ за 1кк:\n"]
+                        lines = [
+                            f"🔔 {a.get('server', DEFAULT_SERVER)}: лоты дешевле "
+                            f"{fmt_num(a['price'])} ₽ за 1кк:\n"
+                        ]
                         for o in new[:ALERT_MAX_LOTS]:
                             lines.append(
                                 f"{o['seller']} / {fmt_num(o['amount'])} кк / "
@@ -761,6 +999,7 @@ app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("ping", ping))
 app.add_handler(CommandHandler("myid", myid))
 app.add_handler(CommandHandler("virts", virts))
+app.add_handler(CommandHandler("server", server_cmd))
 app.add_handler(CommandHandler("min", set_min))
 app.add_handler(CommandHandler("online", toggle_online))
 app.add_handler(CommandHandler("reset", reset))

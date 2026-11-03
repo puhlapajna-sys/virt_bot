@@ -12,8 +12,8 @@ from telegram.ext import (
 
 TOKEN = os.environ.get("BOT_TOKEN", "ТВОЙ_ТОКЕН")
 URL = "https://funpay.com/chips/51/"
-SERVER_NAME = "Grnd.gg Grand Mobile №01"   # точное название сервера
-LIMIT = 30                                 # сколько слотов показывать
+SERVER_NAME = "Grnd.gg Grand Mobile №01"
+LIMIT = 30
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -21,6 +21,7 @@ HEADERS = {
                   "Chrome/124.0 Safari/537.36",
     "Accept-Language": "ru-RU,ru;q=0.9",
 }
+COOKIES = {"cy": "1"}  # просим цены в рублях
 
 
 def norm(text: str) -> str:
@@ -28,7 +29,6 @@ def norm(text: str) -> str:
 
 
 def to_number(text: str) -> float:
-    """'1 000' -> 1000.0, '24.44 ₽' -> 24.44, '20 кк' -> 20.0"""
     cleaned = re.sub(r"[^\d.,]", "", text.replace("\xa0", "").replace(" ", ""))
     cleaned = cleaned.replace(",", ".")
     try:
@@ -37,12 +37,29 @@ def to_number(text: str) -> float:
         return 0.0
 
 
+def parse_price(el):
+    """Возвращает (цена, символ валюты). Рубли в приоритете."""
+    text = el.get_text(" ", strip=True).replace("\xa0", " ")
+    m = re.search(r"(\d[\d ]*(?:[.,]\d+)?)\s*₽", text)
+    if m:
+        return to_number(m.group(1)), "₽"
+    m = re.search(r"(\d[\d ]*(?:[.,]\d+)?)\s*([$€£¥₴₸])", text)
+    if m:
+        return to_number(m.group(1)), m.group(2)
+    m = re.search(r"\d[\d ]*(?:[.,]\d+)?", text)
+    return (to_number(m.group(0)), "?") if m else (0.0, "?")
+
+
 def fmt_num(x: float) -> str:
     return str(int(x)) if x == int(x) else f"{x:g}"
 
 
+def get_page():
+    return requests.get(URL, headers=HEADERS, cookies=COOKIES, timeout=15)
+
+
 def fetch_offers():
-    r = requests.get(URL, headers=HEADERS, timeout=15)
+    r = get_page()
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
 
@@ -60,8 +77,8 @@ def fetch_offers():
         if not (seller_el and amount_el and price_el and href):
             continue
 
-        amount = to_number(amount_el.get_text())   # в кк
-        price = to_number(price_el.get_text())     # цена за 1кк
+        amount = to_number(amount_el.get_text())
+        price, cur = parse_price(price_el)
         if amount <= 0 or price <= 0:
             continue
 
@@ -71,10 +88,10 @@ def fetch_offers():
             "seller": seller_el.get_text(strip=True),
             "amount": amount,
             "price": price,
+            "cur": cur,
             "link": link,
         })
 
-    # от дешёвого к дорогому
     offers.sort(key=lambda o: (o["price"], -o["amount"]))
     return offers
 
@@ -82,7 +99,10 @@ def fetch_offers():
 def format_list(offers):
     lines = [SERVER_NAME, "№. продавец / кол-во / цена за 1кк\n"]
     for i, o in enumerate(offers[:LIMIT], 1):
-        lines.append(f"{i}. {o['seller']} / {fmt_num(o['amount'])} кк / {o['price']:.2f} ₽")
+        lines.append(
+            f"{i}. {o['seller']} / {fmt_num(o['amount'])} кк / "
+            f"{o['price']:.2f} {o['cur']}"
+        )
     lines.append("\nЧтобы получить ссылку, напиши: 4 слот (или слот 4)")
     return "\n".join(lines)
 
@@ -98,7 +118,6 @@ async def virts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Лоты не найдены. Попробуй /debug")
         return
 
-    # запоминаем, что показали, чтобы номера слотов не «поехали»
     context.chat_data["shown"] = offers[:LIMIT]
     await update.message.reply_text(format_list(offers))
 
@@ -115,7 +134,6 @@ async def slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     shown = context.chat_data.get("shown")
     if not shown:
-        # списка ещё не было: берём номер из свежих данных
         context.chat_data["shown"] = shown = fresh[:LIMIT]
 
     if n < 1 or n > len(shown):
@@ -123,11 +141,9 @@ async def slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     old = shown[n - 1]
-    fresh_by_id = {o["id"]: o for o in fresh}
-    cur = fresh_by_id.get(old["id"])
+    cur = {o["id"]: o for o in fresh}.get(old["id"])
 
     if cur is None:
-        # слот исчез: обновляем список
         context.chat_data["shown"] = fresh[:LIMIT]
         await update.message.reply_text(
             f"Слот {n} ({old['seller']}) уже исчез с сайта. Список обновлён:\n\n"
@@ -136,26 +152,31 @@ async def slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = (f"Слот {n}: {cur['seller']} / {fmt_num(cur['amount'])} кк / "
-            f"{cur['price']:.2f} ₽\n{cur['link']}")
+            f"{cur['price']:.2f} {cur['cur']}\n{cur['link']}")
     if cur["price"] != old["price"] or cur["amount"] != old["amount"]:
         text = (f"Данные слота изменились (было {fmt_num(old['amount'])} кк / "
-                f"{old['price']:.2f} ₽)\n") + text
+                f"{old['price']:.2f} {old['cur']})\n") + text
     await update.message.reply_text(text, disable_web_page_preview=True)
 
 
 async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        r = await asyncio.to_thread(requests.get, URL, headers=HEADERS, timeout=15)
+        r = await asyncio.to_thread(get_page)
         soup = BeautifulSoup(r.text, "html.parser")
         items = soup.select("a.tc-item")
         servers = {}
+        sample = ""
         for it in items:
             el = it.select_one(".tc-server")
             name = el.get_text(strip=True) if el else "(нет .tc-server)"
             servers[name] = servers.get(name, 0) + 1
+            if not sample and norm(name) == norm(SERVER_NAME):
+                p = it.select_one(".tc-price")
+                sample = p.get_text(" ", strip=True) if p else "нет .tc-price"
         text = f"HTTP {r.status_code}, лотов на странице: {len(items)}\n"
+        text += f"Пример текста цены: {sample}\n"
         text += "\n".join(f"{k}: {v}" for k, v in list(servers.items())[:30])
-        await update.message.reply_text(text or "Пусто")
+        await update.message.reply_text(text)
     except Exception as e:
         await update.message.reply_text(f"Ошибка: {e}")
 

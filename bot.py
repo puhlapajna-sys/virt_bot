@@ -21,7 +21,8 @@ TOKEN = os.environ.get("BOT_TOKEN", "ТВОЙ_ТОКЕН")
 URL = "https://funpay.com/chips/51/"
 SERVER_NAME = "Grnd.gg Grand Mobile №01"
 LIMIT = 30
-CACHE_TTL = 10  # секунд: не дёргаем сайт чаще
+CACHE_TTL = 10        # секунд: не дёргаем FunPay чаще
+RATES_TTL = 3600      # секунд: курс валют обновляем раз в час
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -29,7 +30,7 @@ HEADERS = {
                   "Chrome/124.0 Safari/537.36",
     "Accept-Language": "ru-RU,ru;q=0.9",
 }
-TIMEOUT = (5, 12)  # (подключение, чтение)
+TIMEOUT = (5, 12)
 
 CANDIDATES = [
     {"name": "cookie cy=rub", "cookies": {"cy": "rub"}, "params": {}},
@@ -40,7 +41,9 @@ CANDIDATES = [
     {"name": "без параметров", "cookies": {}, "params": {}},
 ]
 _working = None
+_no_rub_until = 0.0
 _cache = {"t": 0.0, "data": None}
+_rates = {"t": 0.0, "EUR": None, "USD": None, "src": "нет"}
 
 
 def norm(text: str) -> str:
@@ -80,6 +83,66 @@ def is_online(item) -> bool:
     return False
 
 
+# ---------- курс валют ----------
+
+def _rates_from_cbr():
+    r = requests.get("https://www.cbr-xml-daily.ru/daily_json.js", timeout=(5, 8))
+    r.raise_for_status()
+    v = r.json()["Valute"]
+    return {
+        "EUR": v["EUR"]["Value"] / v["EUR"]["Nominal"],
+        "USD": v["USD"]["Value"] / v["USD"]["Nominal"],
+    }, "ЦБ РФ"
+
+
+def _rates_from_erapi():
+    r = requests.get("https://open.er-api.com/v6/latest/USD", timeout=(5, 8))
+    r.raise_for_status()
+    rt = r.json()["rates"]
+    return {"USD": rt["RUB"], "EUR": rt["RUB"] / rt["EUR"]}, "open.er-api.com"
+
+
+def get_rates():
+    """Возвращает {'EUR': руб за 1 евро, 'USD': руб за 1 доллар}."""
+    now = time.time()
+    if _rates["EUR"] and now - _rates["t"] < RATES_TTL:
+        return _rates
+    for source in (_rates_from_cbr, _rates_from_erapi):
+        try:
+            data, name = source()
+            _rates.update(t=now, src=name, **data)
+            log.info("курс обновлён (%s): EUR=%.2f USD=%.2f",
+                     name, data["EUR"], data["USD"])
+            return _rates
+        except Exception as e:
+            log.warning("курс не получен (%s): %s", source.__name__, e)
+    return _rates  # старый курс, если он был
+
+
+CUR_CODE = {"€": "EUR", "$": "USD"}
+
+
+def to_rub(price: float, cur: str):
+    """Возвращает (цена в рублях или None, была ли конвертация)."""
+    if cur == "₽":
+        return price, False
+    code = CUR_CODE.get(cur)
+    rate = get_rates().get(code) if code else None
+    if rate:
+        return price * rate, True
+    return None, False
+
+
+def show_price(o) -> str:
+    if o["rub"] is None:
+        return f"{o['price']:.2f} {o['cur']}"
+    if o["converted"]:
+        return f"≈{o['rub']:.1f} ₽"
+    return f"{o['rub']:.2f} ₽"
+
+
+# ---------- загрузка FunPay ----------
+
 def _request(c):
     return requests.get(
         URL, headers=HEADERS, cookies=c["cookies"], params=c["params"],
@@ -88,13 +151,14 @@ def _request(c):
 
 
 def _has_rub(html: str) -> bool:
-    """Быстрая проверка без полного парсинга страницы."""
     idx = html.find("tc-price")
     return idx != -1 and "₽" in html[idx: idx + 600]
 
 
 def get_page():
-    global _working
+    global _working, _no_rub_until
+    now = time.time()
+
     if _working is not None:
         try:
             r = _request(_working)
@@ -104,6 +168,10 @@ def get_page():
             log.warning("рабочий способ упал: %s", e)
         _working = None
 
+    if now < _no_rub_until:
+        # недавно уже выяснили, что рубли недоступны: один запрос, без перебора
+        return _request(CANDIDATES[0]), "конвертация по курсу", False
+
     last = None
     for c in CANDIDATES:
         r = _request(c)
@@ -111,11 +179,12 @@ def get_page():
         if _has_rub(r.text):
             _working = c
             return r, c["name"], True
-    return last[0], last[1], False
+
+    _no_rub_until = now + 1800
+    return last[0], "конвертация по курсу", False
 
 
 def load():
-    """Скачивает и разбирает страницу один раз, результат кэшируется."""
     now = time.time()
     if _cache["data"] and now - _cache["t"] < CACHE_TTL:
         return _cache["data"]
@@ -148,6 +217,7 @@ def load():
         if amount <= 0 or price <= 0:
             continue
 
+        rub, converted = to_rub(price, cur)
         link = urljoin("https://funpay.com/", href)
         offers.append({
             "id": link,
@@ -155,11 +225,15 @@ def load():
             "amount": amount,
             "price": price,
             "cur": cur,
+            "rub": rub,
+            "converted": converted,
             "link": link,
             "online": is_online(item),
         })
 
-    offers.sort(key=lambda o: (o["price"], -o["amount"]))
+    offers.sort(key=lambda o: (
+        o["rub"] if o["rub"] is not None else o["price"], -o["amount"]
+    ))
     data = {
         "offers": offers,
         "total_items": len(items),
@@ -177,6 +251,8 @@ def load():
 def fetch_offers():
     return load()["offers"]
 
+
+# ---------- фильтры и вывод ----------
 
 def get_filters(context):
     return context.chat_data.setdefault("filters", {"min": 0.0, "online": False})
@@ -205,21 +281,14 @@ def format_list(offers, f):
              "№. продавец / кол-во / цена за 1кк\n"]
     for i, o in enumerate(offers[:LIMIT], 1):
         lines.append(
-            f"{i}. {o['seller']} / {fmt_num(o['amount'])} кк / "
-            f"{o['price']:.2f} {o['cur']}"
-        )
-    if offers and offers[0]["cur"] != "₽":
-        lines.append(
-            f"\n⚠️ Сайт отдал цены в {offers[0]['cur']}, а не в рублях. "
-            "Выключи VPN на время запуска бота или запусти его на сервере "
-            "с российским IP."
+            f"{i}. {o['seller']} / {fmt_num(o['amount'])} кк / {show_price(o)}"
         )
     lines.append("\nЧтобы получить ссылку, напиши: 4 слот")
     return "\n".join(lines)
 
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("pong (версия 5)")
+    await update.message.reply_text("pong (версия 6)")
 
 
 async def virts(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -307,22 +376,28 @@ async def slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = (f"Слот {n}: {cur['seller']} / {fmt_num(cur['amount'])} кк / "
-            f"{cur['price']:.2f} {cur['cur']}\n{cur['link']}")
+            f"{show_price(cur)}\n{cur['link']}")
     if cur["price"] != old["price"] or cur["amount"] != old["amount"]:
         text = (f"Данные слота изменились (было {fmt_num(old['amount'])} кк / "
-                f"{old['price']:.2f} {old['cur']})\n") + text
+                f"{show_price(old)})\n") + text
     await update.message.reply_text(text, disable_web_page_preview=True)
 
 
 async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏳ Проверяю...")
     d = await asyncio.to_thread(load)
+    rates = get_rates()
     online = sum(1 for o in d["offers"] if o["online"])
+    rate_line = (
+        f"EUR {rates['EUR']:.2f} ₽, USD {rates['USD']:.2f} ₽ ({rates['src']})"
+        if rates["EUR"] else "курс не получен"
+    )
     text = (
         f"HTTP {d['status']}, лотов на странице: {d['total_items']}\n"
         f"Способ: {d['method']}\n"
-        f"Рубли получены: {'да' if d['is_rub'] else 'НЕТ'}\n"
+        f"Рубли с сайта: {'да' if d['is_rub'] else 'нет (пересчёт по курсу)'}\n"
         f"Пример текста цены: {d['sample']}\n"
+        f"Курс: {rate_line}\n"
         f"Лотов сервера: {len(d['offers'])}, онлайн: {online}"
     )
     await update.message.reply_text(text)

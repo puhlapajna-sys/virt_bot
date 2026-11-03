@@ -22,7 +22,6 @@ HEADERS = {
     "Accept-Language": "ru-RU,ru;q=0.9",
 }
 
-# способы попросить у FunPay цены в рублях (пробуем по очереди)
 CANDIDATES = [
     {"name": "cookie cy=rub", "cookies": {"cy": "rub"}, "params": {}},
     {"name": "cookie cy=RUB", "cookies": {"cy": "RUB"}, "params": {}},
@@ -31,7 +30,7 @@ CANDIDATES = [
     {"name": "param ?cy=rub", "cookies": {}, "params": {"cy": "rub"}},
     {"name": "без параметров", "cookies": {}, "params": {}},
 ]
-_working = None  # запомненный рабочий способ
+_working = None
 
 
 def norm(text: str) -> str:
@@ -48,7 +47,6 @@ def to_number(text: str) -> float:
 
 
 def parse_price(el):
-    """Возвращает (цена, символ валюты). Рубли в приоритете."""
     text = el.get_text(" ", strip=True).replace("\xa0", " ")
     m = re.search(r"(\d[\d ]*(?:[.,]\d+)?)\s*₽", text)
     if m:
@@ -62,6 +60,14 @@ def parse_price(el):
 
 def fmt_num(x: float) -> str:
     return str(int(x)) if x == int(x) else f"{x:g}"
+
+
+def is_online(item) -> bool:
+    if item.get("data-online") == "1":
+        return True
+    if item.select_one(".media-user.online"):
+        return True
+    return False
 
 
 def _request(c):
@@ -80,13 +86,12 @@ def _has_rub(html: str) -> bool:
 
 
 def get_page():
-    """Возвращает (response, название_способа, рубли_ли)."""
     global _working
     if _working is not None:
         r = _request(_working)
         if _has_rub(r.text):
             return r, _working["name"], True
-        _working = None  # перестало работать: ищем заново
+        _working = None
 
     last = None
     for c in CANDIDATES:
@@ -99,6 +104,7 @@ def get_page():
 
 
 def fetch_offers():
+    """Все лоты сервера (без фильтров), от дешёвого к дорогому."""
     r, method, is_rub = get_page()
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
@@ -130,14 +136,38 @@ def fetch_offers():
             "price": price,
             "cur": cur,
             "link": link,
+            "online": is_online(item),
         })
 
     offers.sort(key=lambda o: (o["price"], -o["amount"]))
     return offers
 
 
-def format_list(offers):
-    lines = [SERVER_NAME, "№. продавец / кол-во / цена за 1кк\n"]
+def get_filters(context):
+    return context.chat_data.setdefault("filters", {"min": 0.0, "online": False})
+
+
+def apply_filters(offers, f):
+    res = offers
+    if f["min"] > 0:
+        res = [o for o in res if o["amount"] >= f["min"]]
+    if f["online"]:
+        res = [o for o in res if o["online"]]
+    return res
+
+
+def filters_text(f):
+    parts = []
+    if f["min"] > 0:
+        parts.append(f"от {fmt_num(f['min'])} кк")
+    if f["online"]:
+        parts.append("только онлайн")
+    return "Фильтры: " + ", ".join(parts) if parts else "Фильтры: нет"
+
+
+def format_list(offers, f):
+    lines = [SERVER_NAME, filters_text(f),
+             "№. продавец / кол-во / цена за 1кк\n"]
     for i, o in enumerate(offers[:LIMIT], 1):
         lines.append(
             f"{i}. {o['seller']} / {fmt_num(o['amount'])} кк / "
@@ -146,54 +176,103 @@ def format_list(offers):
     if offers and offers[0]["cur"] != "₽":
         lines.append(
             f"\n⚠️ Сайт отдал цены в {offers[0]['cur']}, а не в рублях. "
-            "Скорее всего, виноват VPN или IP сервера. Выключи VPN на время "
-            "запуска бота или запусти его на сервере с российским IP."
+            "Выключи VPN на время запуска бота или запусти его на сервере "
+            "с российским IP."
         )
-    lines.append("\nЧтобы получить ссылку, напиши: 4 слот (или слот 4)")
+    lines.append("\nЧтобы получить ссылку, напиши: 4 слот")
     return "\n".join(lines)
 
 
 async def virts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    f = get_filters(context)
     try:
-        offers = await asyncio.to_thread(fetch_offers)
+        all_offers = await asyncio.to_thread(fetch_offers)
     except Exception as e:
         await update.message.reply_text(f"Ошибка: {e}")
         return
 
+    offers = apply_filters(all_offers, f)
     if not offers:
-        await update.message.reply_text("Лоты не найдены. Попробуй /debug")
+        msg = "Лоты не найдены. Попробуй /debug"
+        if all_offers:
+            msg = ("По текущим фильтрам лотов нет "
+                   f"(всего на сервере: {len(all_offers)}).\n"
+                   f"{filters_text(f)}\nСбросить: /reset")
+        await update.message.reply_text(msg)
         return
 
     context.chat_data["shown"] = offers[:LIMIT]
-    await update.message.reply_text(format_list(offers))
+    await update.message.reply_text(format_list(offers, f))
+
+
+async def set_min(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    f = get_filters(context)
+    if not context.args:
+        await update.message.reply_text(
+            "Напиши число, например: /min 50 (лоты от 50 кк). /min 0 снимает фильтр."
+        )
+        return
+    value = to_number(context.args[0])
+    f["min"] = max(value, 0.0)
+    await update.message.reply_text(
+        f"Готово. {filters_text(f)}\nОбнови список: /virts"
+    )
+
+
+async def toggle_online(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    f = get_filters(context)
+    f["online"] = not f["online"]
+    await update.message.reply_text(
+        f"Только онлайн: {'включено' if f['online'] else 'выключено'}.\n"
+        "Обнови список: /virts"
+    )
+
+
+async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.chat_data["filters"] = {"min": 0.0, "online": False}
+    await update.message.reply_text("Фильтры сброшены. Обнови список: /virts")
+
+
+def parse_slot(text: str):
+    t = text.lower().strip()
+    if "слот" not in t or len(t) > 20:
+        return None
+    m = re.search(r"\d+", t)
+    return int(m.group()) if m else None
 
 
 async def slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    m = re.match(r"(?i)^\s*(?:слот\s*(\d+)|(\d+)\s*слот)\s*$", update.message.text)
-    n = int(m.group(1) or m.group(2))
+    n = parse_slot(update.message.text or "")
+    if n is None:
+        return
+    f = get_filters(context)
 
     try:
-        fresh = await asyncio.to_thread(fetch_offers)
+        all_offers = await asyncio.to_thread(fetch_offers)
     except Exception as e:
         await update.message.reply_text(f"Ошибка: {e}")
         return
 
     shown = context.chat_data.get("shown")
     if not shown:
-        context.chat_data["shown"] = shown = fresh[:LIMIT]
+        context.chat_data["shown"] = shown = apply_filters(all_offers, f)[:LIMIT]
 
     if n < 1 or n > len(shown):
-        await update.message.reply_text(f"Слота {n} нет. Доступно: 1–{len(shown)}")
+        await update.message.reply_text(
+            f"Слота {n} нет. Доступно: 1–{len(shown)}" if shown
+            else "Сначала отправь /virts"
+        )
         return
 
     old = shown[n - 1]
-    cur = {o["id"]: o for o in fresh}.get(old["id"])
+    cur = {o["id"]: o for o in all_offers}.get(old["id"])
 
     if cur is None:
+        fresh = apply_filters(all_offers, f)
         context.chat_data["shown"] = fresh[:LIMIT]
         await update.message.reply_text(
             f"Слот {n} ({old['seller']}) уже исчез с сайта. Список обновлён:\n\n"
-            + format_list(fresh)
+            + format_list(fresh, f)
         )
         return
 
@@ -211,18 +290,22 @@ async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
         soup = BeautifulSoup(r.text, "html.parser")
         items = soup.select("a.tc-item")
         sample = ""
+        total = online = 0
         for it in items:
             el = it.select_one(".tc-server")
             name = el.get_text(strip=True) if el else ""
             if norm(name) == norm(SERVER_NAME):
-                p = it.select_one(".tc-price")
-                sample = p.get_text(" ", strip=True) if p else "нет .tc-price"
-                break
+                total += 1
+                online += is_online(it)
+                if not sample:
+                    p = it.select_one(".tc-price")
+                    sample = p.get_text(" ", strip=True) if p else "нет .tc-price"
         text = (
             f"HTTP {r.status_code}, лотов на странице: {len(items)}\n"
             f"Способ: {method}\n"
             f"Рубли получены: {'да' if is_rub else 'НЕТ'}\n"
-            f"Пример текста цены: {sample}"
+            f"Пример текста цены: {sample}\n"
+            f"Лотов сервера: {total}, онлайн: {online}"
         )
         await update.message.reply_text(text)
     except Exception as e:
@@ -232,15 +315,19 @@ async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "/virts: список слотов от дешёвого к дорогому\n"
-        "«4 слот» или «слот 4»: ссылка на слот"
+        "«4 слот» или «слот 4»: ссылка на слот\n"
+        "/min 50: только лоты от 50 кк (/min 0 снимает)\n"
+        "/online: вкл/выкл только продавцы онлайн\n"
+        "/reset: сбросить фильтры"
     )
 
 
 app = ApplicationBuilder().token(TOKEN).build()
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("virts", virts))
+app.add_handler(CommandHandler("min", set_min))
+app.add_handler(CommandHandler("online", toggle_online))
+app.add_handler(CommandHandler("reset", reset))
 app.add_handler(CommandHandler("debug", debug))
-app.add_handler(MessageHandler(
-    filters.Regex(r"(?i)^\s*(слот\s*\d+|\d+\s*слот)\s*$"), slot
-))
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, slot))
 app.run_polling()

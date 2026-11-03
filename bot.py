@@ -21,7 +21,17 @@ HEADERS = {
                   "Chrome/124.0 Safari/537.36",
     "Accept-Language": "ru-RU,ru;q=0.9",
 }
-COOKIES = {"cy": "1"}  # просим цены в рублях
+
+# способы попросить у FunPay цены в рублях (пробуем по очереди)
+CANDIDATES = [
+    {"name": "cookie cy=rub", "cookies": {"cy": "rub"}, "params": {}},
+    {"name": "cookie cy=RUB", "cookies": {"cy": "RUB"}, "params": {}},
+    {"name": "cookie cy=1", "cookies": {"cy": "1"}, "params": {}},
+    {"name": "cookie cy=2", "cookies": {"cy": "2"}, "params": {}},
+    {"name": "param ?cy=rub", "cookies": {}, "params": {"cy": "rub"}},
+    {"name": "без параметров", "cookies": {}, "params": {}},
+]
+_working = None  # запомненный рабочий способ
 
 
 def norm(text: str) -> str:
@@ -54,12 +64,42 @@ def fmt_num(x: float) -> str:
     return str(int(x)) if x == int(x) else f"{x:g}"
 
 
+def _request(c):
+    return requests.get(
+        URL, headers=HEADERS, cookies=c["cookies"], params=c["params"], timeout=15
+    )
+
+
+def _has_rub(html: str) -> bool:
+    soup = BeautifulSoup(html, "html.parser")
+    for item in soup.select("a.tc-item"):
+        p = item.select_one(".tc-price")
+        if p:
+            return "₽" in p.get_text()
+    return False
+
+
 def get_page():
-    return requests.get(URL, headers=HEADERS, cookies=COOKIES, timeout=15)
+    """Возвращает (response, название_способа, рубли_ли)."""
+    global _working
+    if _working is not None:
+        r = _request(_working)
+        if _has_rub(r.text):
+            return r, _working["name"], True
+        _working = None  # перестало работать: ищем заново
+
+    last = None
+    for c in CANDIDATES:
+        r = _request(c)
+        last = (r, c["name"])
+        if _has_rub(r.text):
+            _working = c
+            return r, c["name"], True
+    return last[0], last[1], False
 
 
 def fetch_offers():
-    r = get_page()
+    r, method, is_rub = get_page()
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
 
@@ -102,6 +142,12 @@ def format_list(offers):
         lines.append(
             f"{i}. {o['seller']} / {fmt_num(o['amount'])} кк / "
             f"{o['price']:.2f} {o['cur']}"
+        )
+    if offers and offers[0]["cur"] != "₽":
+        lines.append(
+            f"\n⚠️ Сайт отдал цены в {offers[0]['cur']}, а не в рублях. "
+            "Скорее всего, виноват VPN или IP сервера. Выключи VPN на время "
+            "запуска бота или запусти его на сервере с российским IP."
         )
     lines.append("\nЧтобы получить ссылку, напиши: 4 слот (или слот 4)")
     return "\n".join(lines)
@@ -161,21 +207,23 @@ async def slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        r = await asyncio.to_thread(get_page)
+        r, method, is_rub = await asyncio.to_thread(get_page)
         soup = BeautifulSoup(r.text, "html.parser")
         items = soup.select("a.tc-item")
-        servers = {}
         sample = ""
         for it in items:
             el = it.select_one(".tc-server")
-            name = el.get_text(strip=True) if el else "(нет .tc-server)"
-            servers[name] = servers.get(name, 0) + 1
-            if not sample and norm(name) == norm(SERVER_NAME):
+            name = el.get_text(strip=True) if el else ""
+            if norm(name) == norm(SERVER_NAME):
                 p = it.select_one(".tc-price")
                 sample = p.get_text(" ", strip=True) if p else "нет .tc-price"
-        text = f"HTTP {r.status_code}, лотов на странице: {len(items)}\n"
-        text += f"Пример текста цены: {sample}\n"
-        text += "\n".join(f"{k}: {v}" for k, v in list(servers.items())[:30])
+                break
+        text = (
+            f"HTTP {r.status_code}, лотов на странице: {len(items)}\n"
+            f"Способ: {method}\n"
+            f"Рубли получены: {'да' if is_rub else 'НЕТ'}\n"
+            f"Пример текста цены: {sample}"
+        )
         await update.message.reply_text(text)
     except Exception as e:
         await update.message.reply_text(f"Ошибка: {e}")

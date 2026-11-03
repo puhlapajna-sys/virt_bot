@@ -1,6 +1,8 @@
 import os
 import re
+import time
 import asyncio
+import logging
 from urllib.parse import urljoin
 
 import requests
@@ -10,10 +12,16 @@ from telegram.ext import (
     ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 )
 
+logging.basicConfig(
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO
+)
+log = logging.getLogger("virts-bot")
+
 TOKEN = os.environ.get("BOT_TOKEN", "ТВОЙ_ТОКЕН")
 URL = "https://funpay.com/chips/51/"
 SERVER_NAME = "Grnd.gg Grand Mobile №01"
 LIMIT = 30
+CACHE_TTL = 10  # секунд: не дёргаем сайт чаще
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -21,6 +29,7 @@ HEADERS = {
                   "Chrome/124.0 Safari/537.36",
     "Accept-Language": "ru-RU,ru;q=0.9",
 }
+TIMEOUT = (5, 12)  # (подключение, чтение)
 
 CANDIDATES = [
     {"name": "cookie cy=rub", "cookies": {"cy": "rub"}, "params": {}},
@@ -31,6 +40,7 @@ CANDIDATES = [
     {"name": "без параметров", "cookies": {}, "params": {}},
 ]
 _working = None
+_cache = {"t": 0.0, "data": None}
 
 
 def norm(text: str) -> str:
@@ -72,25 +82,26 @@ def is_online(item) -> bool:
 
 def _request(c):
     return requests.get(
-        URL, headers=HEADERS, cookies=c["cookies"], params=c["params"], timeout=15
+        URL, headers=HEADERS, cookies=c["cookies"], params=c["params"],
+        timeout=TIMEOUT,
     )
 
 
 def _has_rub(html: str) -> bool:
-    soup = BeautifulSoup(html, "html.parser")
-    for item in soup.select("a.tc-item"):
-        p = item.select_one(".tc-price")
-        if p:
-            return "₽" in p.get_text()
-    return False
+    """Быстрая проверка без полного парсинга страницы."""
+    idx = html.find("tc-price")
+    return idx != -1 and "₽" in html[idx: idx + 600]
 
 
 def get_page():
     global _working
     if _working is not None:
-        r = _request(_working)
-        if _has_rub(r.text):
-            return r, _working["name"], True
+        try:
+            r = _request(_working)
+            if _has_rub(r.text):
+                return r, _working["name"], True
+        except requests.RequestException as e:
+            log.warning("рабочий способ упал: %s", e)
         _working = None
 
     last = None
@@ -103,14 +114,20 @@ def get_page():
     return last[0], last[1], False
 
 
-def fetch_offers():
-    """Все лоты сервера (без фильтров), от дешёвого к дорогому."""
+def load():
+    """Скачивает и разбирает страницу один раз, результат кэшируется."""
+    now = time.time()
+    if _cache["data"] and now - _cache["t"] < CACHE_TTL:
+        return _cache["data"]
+
     r, method, is_rub = get_page()
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
+    items = soup.select("a.tc-item")
 
     offers = []
-    for item in soup.select("a.tc-item"):
+    sample = ""
+    for item in items:
         server_el = item.select_one(".tc-server")
         server = server_el.get_text(strip=True) if server_el else ""
         if norm(server) != norm(SERVER_NAME):
@@ -122,6 +139,9 @@ def fetch_offers():
         href = item.get("href")
         if not (seller_el and amount_el and price_el and href):
             continue
+
+        if not sample:
+            sample = price_el.get_text(" ", strip=True)
 
         amount = to_number(amount_el.get_text())
         price, cur = parse_price(price_el)
@@ -140,7 +160,22 @@ def fetch_offers():
         })
 
     offers.sort(key=lambda o: (o["price"], -o["amount"]))
-    return offers
+    data = {
+        "offers": offers,
+        "total_items": len(items),
+        "status": r.status_code,
+        "method": method,
+        "is_rub": is_rub,
+        "sample": sample,
+    }
+    _cache["t"] = now
+    _cache["data"] = data
+    log.info("страница обновлена: лотов сервера %d", len(offers))
+    return data
+
+
+def fetch_offers():
+    return load()["offers"]
 
 
 def get_filters(context):
@@ -183,13 +218,14 @@ def format_list(offers, f):
     return "\n".join(lines)
 
 
+async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("pong (версия 5)")
+
+
 async def virts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     f = get_filters(context)
-    try:
-        all_offers = await asyncio.to_thread(fetch_offers)
-    except Exception as e:
-        await update.message.reply_text(f"Ошибка: {e}")
-        return
+    await update.message.reply_text("⏳ Загружаю...")
+    all_offers = await asyncio.to_thread(fetch_offers)
 
     offers = apply_filters(all_offers, f)
     if not offers:
@@ -212,8 +248,7 @@ async def set_min(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Напиши число, например: /min 50 (лоты от 50 кк). /min 0 снимает фильтр."
         )
         return
-    value = to_number(context.args[0])
-    f["min"] = max(value, 0.0)
+    f["min"] = max(to_number(context.args[0]), 0.0)
     await update.message.reply_text(
         f"Готово. {filters_text(f)}\nОбнови список: /virts"
     )
@@ -246,12 +281,7 @@ async def slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if n is None:
         return
     f = get_filters(context)
-
-    try:
-        all_offers = await asyncio.to_thread(fetch_offers)
-    except Exception as e:
-        await update.message.reply_text(f"Ошибка: {e}")
-        return
+    all_offers = await asyncio.to_thread(fetch_offers)
 
     shown = context.chat_data.get("shown")
     if not shown:
@@ -285,31 +315,17 @@ async def slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        r, method, is_rub = await asyncio.to_thread(get_page)
-        soup = BeautifulSoup(r.text, "html.parser")
-        items = soup.select("a.tc-item")
-        sample = ""
-        total = online = 0
-        for it in items:
-            el = it.select_one(".tc-server")
-            name = el.get_text(strip=True) if el else ""
-            if norm(name) == norm(SERVER_NAME):
-                total += 1
-                online += is_online(it)
-                if not sample:
-                    p = it.select_one(".tc-price")
-                    sample = p.get_text(" ", strip=True) if p else "нет .tc-price"
-        text = (
-            f"HTTP {r.status_code}, лотов на странице: {len(items)}\n"
-            f"Способ: {method}\n"
-            f"Рубли получены: {'да' if is_rub else 'НЕТ'}\n"
-            f"Пример текста цены: {sample}\n"
-            f"Лотов сервера: {total}, онлайн: {online}"
-        )
-        await update.message.reply_text(text)
-    except Exception as e:
-        await update.message.reply_text(f"Ошибка: {e}")
+    await update.message.reply_text("⏳ Проверяю...")
+    d = await asyncio.to_thread(load)
+    online = sum(1 for o in d["offers"] if o["online"])
+    text = (
+        f"HTTP {d['status']}, лотов на странице: {d['total_items']}\n"
+        f"Способ: {d['method']}\n"
+        f"Рубли получены: {'да' if d['is_rub'] else 'НЕТ'}\n"
+        f"Пример текста цены: {d['sample']}\n"
+        f"Лотов сервера: {len(d['offers'])}, онлайн: {online}"
+    )
+    await update.message.reply_text(text)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -318,16 +334,35 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "«4 слот» или «слот 4»: ссылка на слот\n"
         "/min 50: только лоты от 50 кк (/min 0 снимает)\n"
         "/online: вкл/выкл только продавцы онлайн\n"
-        "/reset: сбросить фильтры"
+        "/reset: сбросить фильтры\n"
+        "/ping: проверка, что бот жив"
     )
 
 
-app = ApplicationBuilder().token(TOKEN).build()
+async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
+    log.error("Ошибка в обработчике", exc_info=context.error)
+    if isinstance(update, Update) and update.effective_message:
+        try:
+            await update.effective_message.reply_text(
+                f"Ошибка бота: {type(context.error).__name__}: {context.error}"
+            )
+        except Exception:
+            pass
+
+
+app = (
+    ApplicationBuilder()
+    .token(TOKEN)
+    .concurrent_updates(True)
+    .build()
+)
 app.add_handler(CommandHandler("start", start))
+app.add_handler(CommandHandler("ping", ping))
 app.add_handler(CommandHandler("virts", virts))
 app.add_handler(CommandHandler("min", set_min))
 app.add_handler(CommandHandler("online", toggle_online))
 app.add_handler(CommandHandler("reset", reset))
 app.add_handler(CommandHandler("debug", debug))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, slot))
+app.add_error_handler(on_error)
 app.run_polling()

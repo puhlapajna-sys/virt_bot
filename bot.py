@@ -8,10 +8,11 @@ from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import BadRequest
 from telegram.ext import (
-    ApplicationBuilder, ApplicationHandlerStop, CommandHandler,
-    ContextTypes, MessageHandler, TypeHandler, filters
+    ApplicationBuilder, ApplicationHandlerStop, CallbackQueryHandler,
+    CommandHandler, ContextTypes, MessageHandler, TypeHandler, filters
 )
 
 logging.basicConfig(
@@ -30,7 +31,9 @@ DATA_FILE = os.environ.get("DATA_FILE", "data.json")
 
 URL = "https://funpay.com/chips/51/"
 SERVER_NAME = "Grnd.gg Grand Mobile №01"
-LIMIT = 30
+LIMIT = 30             # сколько лотов всего доступно в списке
+PAGE = 10              # сколько лотов на одной странице
+MIN_BUTTONS = [0, 10, 50, 100]   # кнопки фильтра по количеству (кк)
 CACHE_TTL = 10         # секунд: не дёргаем FunPay чаще
 RATES_TTL = 3600       # секунд: курс валют обновляем раз в час
 CHECK_INTERVAL = 120   # секунд: как часто проверять уведомления
@@ -299,7 +302,7 @@ def fetch_offers():
     return load()["offers"]
 
 
-# ---------- фильтры и вывод ----------
+# ---------- фильтры ----------
 
 def apply_filters(offers, f):
     res = offers
@@ -319,24 +322,133 @@ def filters_text(f):
     return "Фильтры: " + ", ".join(parts) if parts else "Фильтры: нет"
 
 
-def format_list(offers, f):
-    lines = [SERVER_NAME, filters_text(f),
-             "№. продавец / кол-во / цена за 1кк\n"]
-    for i, o in enumerate(offers[:LIMIT], 1):
-        lines.append(
-            f"{i}. {o['seller']} / {fmt_num(o['amount'])} кк / {show_price(o)}"
-        )
-    lines.append("\nЧтобы получить ссылку, напиши: 4 слот")
-    return "\n".join(lines)
-
-
 def matching_alert(offers, cfg):
-    """Лоты, подходящие под порог уведомления и текущие фильтры."""
     a = cfg["alert"]
     return [
         o for o in apply_filters(offers, cfg)
         if o["rub"] is not None and o["rub"] <= a["price"]
     ]
+
+
+# ---------- список с кнопками ----------
+
+async def refresh_shown(context, f):
+    """Скачивает свежие данные и обновляет список, который видит пользователь."""
+    all_offers = await asyncio.to_thread(fetch_offers)
+    offers = apply_filters(all_offers, f)
+    context.chat_data["shown"] = offers[:LIMIT]
+    context.chat_data["total"] = len(all_offers)
+    context.chat_data["page"] = 0
+    return all_offers
+
+
+def build_view(context, f):
+    """Возвращает (текст, клавиатура) для текущей страницы списка."""
+    shown = context.chat_data.get("shown") or []
+    total = context.chat_data.get("total", 0)
+    pages = max(1, -(-len(shown) // PAGE))
+    page = min(max(context.chat_data.get("page", 0), 0), pages - 1)
+    context.chat_data["page"] = page
+
+    if not shown:
+        text = (f"{SERVER_NAME}\n{filters_text(f)}\n\n"
+                f"По текущим фильтрам лотов нет (всего на сервере: {total}).")
+    else:
+        start = page * PAGE
+        chunk = shown[start:start + PAGE]
+        lines = [SERVER_NAME, filters_text(f), f"Страница {page + 1}/{pages}\n",
+                 "№. продавец / кол-во / цена за 1кк\n"]
+        for i, o in enumerate(chunk, start + 1):
+            lines.append(
+                f"{i}. {o['seller']} / {fmt_num(o['amount'])} кк / {show_price(o)}"
+            )
+        lines.append("\nНажми номер слота, чтобы получить ссылку.")
+        text = "\n".join(lines)
+
+    rows = []
+
+    # номера слотов текущей страницы (по 5 в ряд)
+    if shown:
+        start = page * PAGE
+        nums = [
+            InlineKeyboardButton(str(i), callback_data=f"s:{i}")
+            for i in range(start + 1, start + len(shown[start:start + PAGE]) + 1)
+        ]
+        for k in range(0, len(nums), 5):
+            rows.append(nums[k:k + 5])
+
+    # переключение страниц
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("◀", callback_data=f"p:{page - 1}"))
+        nav.append(InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="n"))
+        if page < pages - 1:
+            nav.append(InlineKeyboardButton("▶", callback_data=f"p:{page + 1}"))
+        rows.append(nav)
+
+    # фильтр по количеству
+    rows.append([
+        InlineKeyboardButton(
+            ("✅ " if f["min"] == v else "") + ("Все" if v == 0 else f"от {v}"),
+            callback_data=f"m:{v}",
+        )
+        for v in MIN_BUTTONS
+    ])
+
+    # онлайн и обновление
+    rows.append([
+        InlineKeyboardButton(
+            "🟢 Онлайн: вкл" if f["online"] else "⚪ Онлайн: выкл",
+            callback_data="o",
+        ),
+        InlineKeyboardButton("🔄 Обновить", callback_data="r"),
+    ])
+
+    return text, InlineKeyboardMarkup(rows)
+
+
+async def safe_edit(message, text, markup):
+    try:
+        await message.edit_text(text, reply_markup=markup,
+                                disable_web_page_preview=True)
+    except BadRequest as e:
+        if "not modified" not in str(e).lower():
+            raise
+
+
+async def resolve_slot(context, f, n):
+    """Возвращает (статус, текст). Статусы: ok, gone, range."""
+    all_offers = await asyncio.to_thread(fetch_offers)
+
+    shown = context.chat_data.get("shown")
+    if not shown:
+        context.chat_data["shown"] = shown = apply_filters(all_offers, f)[:LIMIT]
+        context.chat_data["total"] = len(all_offers)
+        context.chat_data["page"] = 0
+
+    if n < 1 or n > len(shown):
+        return "range", (
+            f"Слота {n} нет. Доступно: 1–{len(shown)}" if shown
+            else "Сначала отправь /virts"
+        )
+
+    old = shown[n - 1]
+    cur = {o["id"]: o for o in all_offers}.get(old["id"])
+
+    if cur is None:
+        fresh = apply_filters(all_offers, f)
+        context.chat_data["shown"] = fresh[:LIMIT]
+        context.chat_data["total"] = len(all_offers)
+        context.chat_data["page"] = 0
+        return "gone", f"Слот {n} ({old['seller']}) уже исчез с сайта."
+
+    text = (f"Слот {n}: {cur['seller']} / {fmt_num(cur['amount'])} кк / "
+            f"{show_price(cur)}\n{cur['link']}")
+    if cur["price"] != old["price"] or cur["amount"] != old["amount"]:
+        text = (f"Данные слота изменились (было {fmt_num(old['amount'])} кк / "
+                f"{show_price(old)})\n") + text
+    return "ok", text
 
 
 # ---------- доступ ----------
@@ -360,26 +472,80 @@ async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------- команды ----------
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("pong (версия 7)")
+    await update.message.reply_text("pong (версия 8)")
 
 
 async def virts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     f = chat_cfg(update.effective_chat.id)
-    await update.message.reply_text("⏳ Загружаю...")
-    all_offers = await asyncio.to_thread(fetch_offers)
+    msg = await update.message.reply_text("⏳ Загружаю...")
+    await refresh_shown(context, f)
+    text, markup = build_view(context, f)
+    await safe_edit(msg, text, markup)
 
-    offers = apply_filters(all_offers, f)
-    if not offers:
-        msg = "Лоты не найдены. Попробуй /debug"
-        if all_offers:
-            msg = ("По текущим фильтрам лотов нет "
-                   f"(всего на сервере: {len(all_offers)}).\n"
-                   f"{filters_text(f)}\nСбросить: /reset")
-        await update.message.reply_text(msg)
-        return
 
-    context.chat_data["shown"] = offers[:LIMIT]
-    await update.message.reply_text(format_list(offers, f))
+async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    data = q.data or ""
+    f = chat_cfg(update.effective_chat.id)
+
+    try:
+        if data == "n":
+            await q.answer()
+            return
+
+        # ссылка на слот
+        if data.startswith("s:"):
+            n = int(data[2:])
+            if not context.chat_data.get("shown"):
+                await q.answer("Список устарел, отправь /virts заново.",
+                               show_alert=True)
+                return
+            status, text = await resolve_slot(context, f, n)
+            if status == "ok":
+                await q.answer()
+                await q.message.reply_text(text, disable_web_page_preview=True)
+            elif status == "gone":
+                await q.answer(text + " Список обновлён.", show_alert=True)
+                t, markup = build_view(context, f)
+                await safe_edit(q.message, t, markup)
+            else:
+                await q.answer(text, show_alert=True)
+            return
+
+        # переключение страницы (без перезагрузки данных, чтобы номера не «поехали»)
+        if data.startswith("p:"):
+            if not context.chat_data.get("shown"):
+                await q.answer("Список устарел, отправь /virts заново.",
+                               show_alert=True)
+                return
+            context.chat_data["page"] = int(data[2:])
+            await q.answer()
+            t, markup = build_view(context, f)
+            await safe_edit(q.message, t, markup)
+            return
+
+        # фильтры и обновление: перезагружаем данные
+        if data.startswith("m:"):
+            f["min"] = float(data[2:])
+            save_store()
+        elif data == "o":
+            f["online"] = not f["online"]
+            save_store()
+        elif data != "r":
+            await q.answer()
+            return
+
+        await q.answer()
+        await refresh_shown(context, f)
+        t, markup = build_view(context, f)
+        await safe_edit(q.message, t, markup)
+
+    except Exception:
+        log.exception("ошибка в обработке кнопки %s", data)
+        try:
+            await q.answer("Ошибка, попробуй ещё раз.", show_alert=True)
+        except Exception:
+            pass
 
 
 async def set_min(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -473,37 +639,12 @@ async def slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if n is None:
         return
     f = chat_cfg(update.effective_chat.id)
-    all_offers = await asyncio.to_thread(fetch_offers)
-
-    shown = context.chat_data.get("shown")
-    if not shown:
-        context.chat_data["shown"] = shown = apply_filters(all_offers, f)[:LIMIT]
-
-    if n < 1 or n > len(shown):
-        await update.message.reply_text(
-            f"Слота {n} нет. Доступно: 1–{len(shown)}" if shown
-            else "Сначала отправь /virts"
-        )
-        return
-
-    old = shown[n - 1]
-    cur = {o["id"]: o for o in all_offers}.get(old["id"])
-
-    if cur is None:
-        fresh = apply_filters(all_offers, f)
-        context.chat_data["shown"] = fresh[:LIMIT]
-        await update.message.reply_text(
-            f"Слот {n} ({old['seller']}) уже исчез с сайта. Список обновлён:\n\n"
-            + format_list(fresh, f)
-        )
-        return
-
-    text = (f"Слот {n}: {cur['seller']} / {fmt_num(cur['amount'])} кк / "
-            f"{show_price(cur)}\n{cur['link']}")
-    if cur["price"] != old["price"] or cur["amount"] != old["amount"]:
-        text = (f"Данные слота изменились (было {fmt_num(old['amount'])} кк / "
-                f"{show_price(old)})\n") + text
+    status, text = await resolve_slot(context, f, n)
     await update.message.reply_text(text, disable_web_page_preview=True)
+    if status == "gone":
+        t, markup = build_view(context, f)
+        await update.message.reply_text(t, reply_markup=markup,
+                                        disable_web_page_preview=True)
 
 
 async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -516,6 +657,7 @@ async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"EUR {rates['EUR']:.2f} ₽, USD {rates['USD']:.2f} ₽ ({rates['src']})"
         if rates["EUR"] else "курс не получен"
     )
+    access = f"ограничен ({len(ALLOWED)} ID)" if ALLOWED else "открыт всем"
     text = (
         f"HTTP {d['status']}, лотов на странице: {d['total_items']}\n"
         f"Способ: {d['method']}\n"
@@ -523,7 +665,7 @@ async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Пример текста цены: {d['sample']}\n"
         f"Курс: {rate_line}\n"
         f"Лотов сервера: {len(d['offers'])}, онлайн: {online}\n"
-        f"Доступ: {'ограничен (' + str(len(ALLOWED)) + ' ID)' if ALLOWED else 'открыт всем'}\n"
+        f"Доступ: {access}\n"
         f"Активных уведомлений: {alerts}"
     )
     await update.message.reply_text(text)
@@ -531,7 +673,7 @@ async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "/virts: список слотов от дешёвого к дорогому\n"
+        "/virts: список слотов с кнопками (номера, страницы, фильтры)\n"
         "«4 слот» или «слот 4»: ссылка на слот\n"
         "/min 50: только лоты от 50 кк (/min 0 снимает)\n"
         "/online: вкл/выкл только продавцы онлайн\n"
@@ -576,7 +718,7 @@ async def alert_loop(app):
                             )
                         except Exception:
                             log.exception("не удалось отправить уведомление в %s", cid)
-                            continue  # попробуем в следующий раз
+                            continue
 
                     if ids != old:
                         a["notified"] = sorted(ids)
@@ -624,6 +766,7 @@ app.add_handler(CommandHandler("online", toggle_online))
 app.add_handler(CommandHandler("reset", reset))
 app.add_handler(CommandHandler("alert", alert_cmd))
 app.add_handler(CommandHandler("debug", debug))
+app.add_handler(CallbackQueryHandler(on_button))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, slot))
 app.add_error_handler(on_error)
 app.run_polling()
